@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.4
+
+Small cleanups and hardening.
+
+- The plugin now keeps the Ookla speedtest CLI up to date by itself. On the first speedtest after Dispatcharr starts, it checks Ookla's download server for a newer release and installs it, so a restart is all it takes. A new release is test-started before it replaces the working one, and if the check or download fails the installed CLI keeps being used. `SPEEDTEST_CLI_VERSION` is gone; `SPEEDTEST_CLI_BASE_VERSION` is only the starting point for a first install.
+- The default timezone is now UTC instead of US Central. Installs that already saved a timezone keep it; installs that never touched the setting will now see UTC.
+- The Discord webhook response is now closed after each post instead of being left for garbage collection.
+- The "can't read saved settings" warning now says what it actually knows (no saved settings found, or the database is unreachable), and it can fire again if the problem comes back.
+- Removed an unused `stat` import.
+- A scheduled run that is skipped because someone is watching now retries after 30 minutes instead of waiting a full interval (never longer than the interval itself).
+- Skipped runs no longer replace the last real result in Status. Status shows "Last run" for the last actual test, plus a separate note such as "Skipped 3 times in a row because someone was watching". After three skips in a row it suggests the Check Active Streams button, in case something is being detected that shouldn't be. A real run resets the count.
+- Status now shows which speedtest CLI version is installed.
+- The "check that Dispatcharr can reach install.speedtest.net" hint now appears only on download failures, not when a new CLI fails its startup test.
+- The settings the background scheduler falls back on are now swapped in one step instead of cleared and refilled, which removes a very small window where the scheduler could see them empty.
+
 ## 1.0.3
 
 - Fixed an issue where the plugin in Dispatcharr still showed version 1.0.1.

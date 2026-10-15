@@ -4,13 +4,13 @@ Packet Slapper: a speedtest plugin for Dispatcharr.
 Runs scheduled or on-demand Ookla Speedtests through your Dispatcharr instance.
 """
 
+import hashlib
 import importlib
 import json
 import shutil
 import logging
 import os
 import platform
-import stat
 import subprocess
 import tarfile
 import tempfile
@@ -32,7 +32,13 @@ PLUGIN_DATA_DIR = os.path.join("/data/plugins", _PLUGIN_KEY)
 BIN_DIR = os.path.join(PLUGIN_DATA_DIR, "bin")
 SPEEDTEST_BIN = os.path.join(BIN_DIR, "speedtest")
 SPEEDTEST_VERSION_FILE = os.path.join(BIN_DIR, "speedtest.version")
-SPEEDTEST_CLI_VERSION = "1.2.0"  # bump if Ookla ships a newer CLI release
+# Known-good CLI version, used for a first install and as the floor when looking for
+# newer releases. Newer releases are picked up automatically (see _ensure_speedtest_binary),
+# so this never needs bumping.
+SPEEDTEST_CLI_BASE_VERSION = "1.2.0"
+_CLI_URL = "https://install.speedtest.net/app/cli/ookla-speedtest-{version}-linux-{arch}.tgz"
+_cli_update_checked = False  # True once this process has looked for a newer CLI
+_DEFAULT_TIMEZONE = "UTC"
 SPEEDTEST_TIMEOUT = 90  # seconds
 
 # Module-level so state survives across Plugin instances (Dispatcharr may
@@ -42,6 +48,7 @@ _controller_stop = threading.Event()
 _lock = threading.Lock()
 _state = {}             # scheduler state while this process is the active scheduler
 _local_last_run = {}    # fallback if Redis is unavailable
+_local_last_skip = {}   # same, for the skip streak
 _last_settings = {}     # most recent settings seen by a button click (DB-read fallback)
 _logger_holder = {"logger": None}
 
@@ -56,12 +63,15 @@ _DEFAULT_INTERVAL_MINUTES = 60
 _LEADER_KEY = "packet_slapper:scheduler:leader"
 _STATE_KEY = "packet_slapper:scheduler:state"
 _LAST_RUN_KEY = "packet_slapper:last_run"
+_LAST_SKIP_KEY = "packet_slapper:last_skip"   # current streak of runs skipped because someone was watching
 _RUNNING_KEY = "packet_slapper:running"   # guards against two speedtests at once
 _LEADER_TTL = 240       # seconds; longer than the slowest speedtest so the lease isn't lost mid-run
 _STATE_TTL = 300
 _RUN_TTL = 240
 _TICK_SECONDS = 5
 _BUSY_RETRY_SECONDS = 60  # retry delay when a scheduled run finds another test in progress
+_SKIP_RETRY_SECONDS = 1800  # retry delay after a run is skipped because someone was watching
+_SKIP_HINT_AFTER = 3    # skips in a row before Status suggests checking what is being detected
 _STARTUP_DELAY = 10     # let Dispatcharr finish starting before the first DB read
 
 
@@ -86,21 +96,61 @@ def _installed_cli_version():
         return None
 
 
-def _ensure_speedtest_binary(logger):
-    """Download the official Ookla speedtest CLI into plugin data dir if missing or outdated."""
-    if (
-        os.path.isfile(SPEEDTEST_BIN)
-        and os.access(SPEEDTEST_BIN, os.X_OK)
-        and _installed_cli_version() == SPEEDTEST_CLI_VERSION
-    ):
-        return SPEEDTEST_BIN
+def _set_last_settings(settings):
+    """Replace the cached settings in one step, so the background thread never sees a half-filled dict."""
+    global _last_settings
+    _last_settings = dict(settings)
 
-    os.makedirs(BIN_DIR, exist_ok=True)
-    arch = _arch_suffix()
-    url = (
-        f"https://install.speedtest.net/app/cli/"
-        f"ookla-speedtest-{SPEEDTEST_CLI_VERSION}-linux-{arch}.tgz"
+
+def _version_tuple(version):
+    try:
+        return tuple(int(x) for x in str(version).strip().split("."))
+    except ValueError:
+        return None
+
+
+def _next_versions(version):
+    """The releases that could directly follow this one: next patch, minor and major."""
+    parts = _version_tuple(version)
+    if not parts:
+        return []
+    parts = (list(parts) + [0, 0, 0])[:3]
+    major, minor, patch = parts
+    return [f"{major}.{minor}.{patch + 1}", f"{major}.{minor + 1}.0", f"{major + 1}.0.0"]
+
+
+def _cli_exists(version, arch):
+    """True if Ookla's CDN has this CLI release (HEAD request, nothing is downloaded)."""
+    req = urllib.request.Request(
+        _CLI_URL.format(version=version, arch=arch),
+        headers={"User-Agent": "Mozilla/5.0 (PacketSlapper/1.0)"},
+        method="HEAD",
     )
+    try:
+        with urllib.request.urlopen(req, timeout=15):  # noqa: S310 - fixed Ookla CDN URL
+            return True
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 404):  # the CDN answers 403 or 404 for releases that don't exist
+            return False
+        raise
+
+
+def _latest_cli_version(start, arch):
+    """Newest release at or above `start`, found by probing the CDN for the next version numbers."""
+    latest = start
+    for _ in range(20):  # safety cap
+        found = [v for v in _next_versions(latest) if _cli_exists(v, arch)]
+        if not found:
+            break
+        latest = found[0]
+    return latest
+
+
+def _install_cli(version, arch, logger):
+    """Download one CLI release and swap it in. Raises RuntimeError if anything goes wrong,
+    leaving any previously installed binary untouched."""
+    os.makedirs(BIN_DIR, exist_ok=True)
+    url = _CLI_URL.format(version=version, arch=arch)
     logger.info(f"Packet Slapper: downloading Ookla CLI from {url}")
 
     staged = SPEEDTEST_BIN + ".new"
@@ -109,6 +159,8 @@ def _ensure_speedtest_binary(logger):
             tgz_path = os.path.join(tmp, "speedtest.tgz")
             with urllib.request.urlopen(url, timeout=60) as resp, open(tgz_path, "wb") as out:  # noqa: S310 - fixed Ookla CDN URL
                 shutil.copyfileobj(resp, out)
+            with open(tgz_path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
             # Read the one member we need straight out of the archive instead of
             # extracting to disk, so nothing in the tarball can pick its own path.
             # It lands in the bin dir under a temp name and is swapped in below,
@@ -128,18 +180,73 @@ def _ensure_speedtest_binary(logger):
                 fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
                 with src, os.fdopen(fd, "wb") as out:
                     shutil.copyfileobj(src, out)
+        if version != SPEEDTEST_CLI_BASE_VERSION:
+            # A release we haven't seen before: make sure it starts on this system before it
+            # replaces the working one. If it doesn't, the old binary stays in place.
+            try:
+                check = subprocess.run([staged, "--version"], capture_output=True, text=True, timeout=20, env=_cli_env())
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RuntimeError(f"the new CLI would not start ({exc})") from exc
+            if check.returncode != 0:
+                raise RuntimeError(f"the new CLI failed its startup check (exit code {check.returncode})")
         os.replace(staged, SPEEDTEST_BIN)
         with open(SPEEDTEST_VERSION_FILE + ".new", "w") as fh:
-            fh.write(SPEEDTEST_CLI_VERSION)
+            fh.write(version)
         os.replace(SPEEDTEST_VERSION_FILE + ".new", SPEEDTEST_VERSION_FILE)
     except Exception as exc:
         try:
             os.remove(staged)
         except OSError:
             pass
-        raise RuntimeError(f"Could not download the Ookla speedtest CLI ({exc}). Check that Dispatcharr can reach install.speedtest.net.") from exc
+        hint = "" if isinstance(exc, RuntimeError) else " Check that Dispatcharr can reach install.speedtest.net."
+        raise RuntimeError(f"Could not install the Ookla speedtest CLI {version} ({exc}).{hint}") from exc
+    logger.info(f"Packet Slapper: installed Ookla CLI {version} (download sha256 {digest})")
 
-    return SPEEDTEST_BIN
+
+def _ensure_speedtest_binary(logger):
+    """Make sure the Ookla CLI is installed, and on the first run after Dispatcharr starts,
+    upgrade it to the newest release.
+
+    The newest release is found by probing Ookla's CDN, so a new CLI is picked up on the
+    next Dispatcharr restart with no change to the plugin. If the check, the download or the
+    new CLI's startup test fails, the binary that's already installed keeps being used.
+    """
+    global _cli_update_checked
+    installed = _installed_cli_version()
+    have_binary = os.path.isfile(SPEEDTEST_BIN) and os.access(SPEEDTEST_BIN, os.X_OK)
+    if have_binary and installed and _cli_update_checked:
+        return SPEEDTEST_BIN
+
+    arch = _arch_suffix()
+    floor = SPEEDTEST_CLI_BASE_VERSION
+    if have_binary and installed and (_version_tuple(installed) or ()) > (_version_tuple(floor) or ()):
+        floor = installed
+
+    try:
+        target = _latest_cli_version(floor, arch)
+    except Exception as exc:
+        logger.warning(f"Packet Slapper: could not check for a newer speedtest CLI ({exc})")
+        target = None
+    _cli_update_checked = True
+
+    if have_binary and installed and (target is None or target == installed):
+        return SPEEDTEST_BIN
+
+    attempts = [v for v in (target, floor if not have_binary else None) if v]
+    if not attempts:
+        attempts = [floor]
+    last_error = None
+    for version in dict.fromkeys(attempts):  # de-duplicated, in order
+        try:
+            _install_cli(version, arch, logger)
+            return SPEEDTEST_BIN
+        except RuntimeError as exc:
+            last_error = exc
+            logger.warning(f"Packet Slapper: {exc}")
+    if have_binary:
+        logger.warning(f"Packet Slapper: keeping the installed speedtest CLI ({installed or 'unknown version'})")
+        return SPEEDTEST_BIN
+    raise last_error
 
 
 def _cli_env():
@@ -383,7 +490,8 @@ def _post_to_discord(webhook_url, payload, logger):
         method="POST",
     )
     try:
-        urllib.request.urlopen(req, timeout=15)  # noqa: S310 - user-supplied webhook, by design
+        with urllib.request.urlopen(req, timeout=15):  # noqa: S310 - user-supplied webhook, by design
+            pass
         return True
     except urllib.error.HTTPError as exc:
         try:
@@ -577,7 +685,7 @@ def _execute_run(settings, logger, manual=False):
         logger.info("Packet Slapper: skipping scheduled run, active streams detected")
         return {"status": "skipped", "message": "Active streams detected; run skipped"}
 
-    tz_name = str(settings.get("display_timezone") or "America/Chicago").strip()
+    tz_name = str(settings.get("display_timezone") or _DEFAULT_TIMEZONE).strip()
     webhook_url = str(settings.get("discord_webhook_url") or "").strip()
     style = _discord_style(settings)
 
@@ -661,18 +769,46 @@ def _do_one_run(settings, logger, manual=False):
 
 
 def _record_last_run(logger, outcome, manual):
+    """Remember the outcome for the Status button.
+
+    Real results (ok / error) are the "last run". A skipped run doesn't replace them:
+    it only extends a separate "skipped N times in a row" streak, which a real run resets.
+    """
     status = outcome.get("status")
+    client = _get_redis_client(logger)
+    if status == "skipped":
+        previous = _load_skip_streak(logger) or {}
+        record = {"at": time.time(), "count": int(previous.get("count") or 0) + 1}
+        _local_last_skip.clear()
+        _local_last_skip.update(record)
+        _redis_set(client, _LAST_SKIP_KEY, json.dumps(record))  # no TTL: survives a stop
+        return
     if status == "ok":
         r = outcome.get("result") or {}
         detail = f"{r.get('download_mbps')} Mbps down / {r.get('upload_mbps')} Mbps up"
-    elif status == "skipped":
-        detail = "someone was watching"
     else:
         detail = str(outcome.get("message", ""))[:120]
     record = {"at": time.time(), "status": status, "manual": bool(manual), "detail": detail}
     _local_last_run.clear()
     _local_last_run.update(record)
-    _redis_set(_get_redis_client(logger), _LAST_RUN_KEY, json.dumps(record))  # no TTL: survives a stop
+    _redis_set(client, _LAST_RUN_KEY, json.dumps(record))  # no TTL: survives a stop
+    _local_last_skip.clear()  # a real run ends any skip streak
+    if client is not None:
+        try:
+            client.delete(_LAST_SKIP_KEY)
+        except Exception:
+            logger.debug("Packet Slapper: could not clear the skip streak", exc_info=True)
+
+
+def _load_skip_streak(logger):
+    client = _get_redis_client(logger)
+    if client is not None:
+        try:
+            raw = client.get(_LAST_SKIP_KEY)
+            return json.loads(_s(raw)) if raw else None
+        except Exception:
+            pass
+    return dict(_local_last_skip) or None
 
 
 def _redis_set(client, key, value, ttl=None):
@@ -804,8 +940,13 @@ def _scheduler_tick(client, settings, logger, holding):
             outcome = _do_one_run(settings, logger, manual=False)
         except Exception:
             logger.exception("Packet Slapper: unhandled error in scheduled run")
-        busy = isinstance(outcome, dict) and outcome.get("status") == "busy"
-        delay = min(_BUSY_RETRY_SECONDS, interval_seconds) if busy else interval_seconds
+        run_status = outcome.get("status") if isinstance(outcome, dict) else None
+        if run_status == "busy":
+            delay = min(_BUSY_RETRY_SECONDS, interval_seconds)
+        elif run_status == "skipped":
+            delay = min(_SKIP_RETRY_SECONDS, interval_seconds)  # don't lose a whole interval to one evening of TV
+        else:
+            delay = interval_seconds
         _state["next_run_at"] = time.time() + delay
 
     _publish_state(client)
@@ -829,7 +970,8 @@ def _controller_loop():
                 if snapshot is None:
                     if not warned:
                         logger.warning(
-                            "Packet Slapper: can't read saved settings from the database; "
+                            "Packet Slapper: no saved settings found for this plugin in the database "
+                            "(not saved yet, or the database is unreachable); "
                             "using the settings from the last button click instead"
                         )
                         warned = True
@@ -840,6 +982,7 @@ def _controller_loop():
                         continue
                     plugin_enabled, settings = True, dict(_last_settings)
                 else:
+                    warned = False  # re-arm the warning in case the DB goes away again
                     plugin_enabled, settings = snapshot
 
                 if plugin_enabled and _interval_minutes(settings) is not None:
@@ -928,7 +1071,7 @@ _LAST_RUN_ICONS = {"ok": "\u2705", "skipped": "\u23ed", "error": "\u274c"}
 
 def _describe_scheduler(settings, logger):
     """One-line scheduler status for the popup."""
-    tz_name = str(settings.get("display_timezone") or "America/Chicago").strip()
+    tz_name = str(settings.get("display_timezone") or _DEFAULT_TIMEZONE).strip()
     enabled = _interval_minutes(settings) is not None
     state, shared = _load_scheduler_state(logger)
 
@@ -960,6 +1103,18 @@ def _describe_scheduler(settings, logger):
     else:
         parts.append("No runs recorded yet")
 
+    skips = _load_skip_streak(logger)
+    if skips and skips.get("count"):
+        n = int(skips["count"])
+        times = "once" if n == 1 else f"{n} times in a row"
+        text = f"\u23ed Skipped {times} because someone was watching (latest {_fmt_time(skips['at'], tz_name)})"
+        if n >= _SKIP_HINT_AFTER:
+            text += "; if nobody really is, use 'Check Active Streams' to see what's being detected"
+        parts.append(text)
+
+    cli_version = _installed_cli_version()
+    parts.append(f"Speedtest CLI {cli_version}" if cli_version else "Speedtest CLI not installed yet (downloads on the first run)")
+
     if not shared:
         parts.append("(Redis unavailable, so this only reflects this worker)")
     return " | ".join(parts)
@@ -967,7 +1122,7 @@ def _describe_scheduler(settings, logger):
 
 class Plugin:
     name = "Packet Slapper"
-    version = "1.0.3"
+    version = "1.0.4"
     description = "Periodic/on-demand speedtests shown in Dispatcharr and optionally posted to Discord, run through Dispatcharr's own network."
 
     fields = []  # defined in plugin.json; kept here only if you drop the manifest
@@ -980,8 +1135,7 @@ class Plugin:
         logger = context.get("logger") or logging.getLogger("plugins.packet_slapper")
 
         _logger_holder["logger"] = logger
-        _last_settings.clear()
-        _last_settings.update(settings)
+        _set_last_settings(settings)
         _ensure_controller()
 
         if action == "run_now":
@@ -1008,6 +1162,6 @@ class Plugin:
         """Called when the plugin is disabled, deleted, or reloaded."""
         logger = context.get("logger") or logging.getLogger("plugins.packet_slapper")
         _controller_stop.set()
-        _last_settings.clear()  # a disabled plugin shouldn't keep a settings fallback
+        _set_last_settings({})  # a disabled plugin shouldn't keep a settings fallback
         _release_leadership(_get_redis_client(logger), logger)
         logger.info("Packet Slapper: stop() called, scheduler signaled to exit")

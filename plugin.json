@@ -1,6 +1,6 @@
 {
   "name": "Packet Slapper",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Runs scheduled or on-demand Ookla Speedtests through Dispatcharr to measure speed and latency.",
   "author": "write-erase",
   "fields": [
@@ -68,7 +68,7 @@
       "id": "display_timezone",
       "label": "Timezone",
       "type": "select",
-      "default": "America/Chicago",
+      "default": "UTC",
       "help_text": "Timezone used to format the result timestamp.",
       "options": [
         {
