@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- New "Publish results for Prometheus" setting (off by default). When it's on, every speedtest is saved to the Redis key `packet_slapper:prometheus:latest`, which the Dispatcharr Exporter plugin serves as `dispatcharr_speedtest_*` metrics. Scheduled and Run Now tests both publish. A failed test records the failed attempt but keeps the last good result. Discord posting is unchanged and works alongside it.
+- The write is read back to confirm it landed and retried up to three times. If it still fails, the popup says "Prometheus metrics update FAILED" and Status shows the run with a warning icon. The test is not re-run early because of this, so a Redis outage can't turn into a speedtest every minute.
+
 ## 1.0.4
 
 Small cleanups and hardening.
