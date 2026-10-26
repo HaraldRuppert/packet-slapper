@@ -7,7 +7,8 @@ Results show right in Dispatcharr, no external service required. You get downloa
 
 A few extras, too. You can pin tests to one specific Ookla server ID so results stay comparable over time, pick your display timezone from a dropdown, and use Check Active Streams or Scheduler Status any time to see what the plugin is doing right now and when the next run is due.
 
-If you scrape Dispatcharr with Prometheus, turn on "Publish results for Prometheus" and the [Dispatcharr Exporter](https://github.com/sethwv/dispatcharr-exporter) plugin can serve each result as `dispatcharr_speedtest_*` metrics. The plugin saves the latest result in Redis under `packet_slapper:prometheus:latest`:
+If you scrape Dispatcharr with Prometheus, turn on "Publish results for Prometheus" and the [Dispatcharr Exporter](https://github.com/swvn-dispatch/dispatcharr-exporter) plugin can serve each result as `dispatcharr_speedtest_*` metrics. The plugin saves the latest result in Redis under `packet_slapper:prometheus:latest`:
+If you scrape Dispatcharr with Prometheus, turn on "Publish results for Prometheus" and the [Dispatcharr Exporter]() plugin can serve each result as `dispatcharr_speedtest_*` metrics. The plugin saves the latest result in Redis under `packet_slapper:prometheus:latest`:
 
 ```json
 {
