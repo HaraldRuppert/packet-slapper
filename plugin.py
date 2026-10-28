@@ -1172,7 +1172,7 @@ def _describe_scheduler(settings, logger):
 
 class Plugin:
     name = "Packet Slapper"
-    version = "1.0.4"
+    version = "1.1.0"
     description = "Periodic/on-demand speedtests shown in Dispatcharr, optionally posted to Discord and exported to Prometheus, run through Dispatcharr's own network."
 
     fields = []  # defined in plugin.json; kept here only if you drop the manifest
