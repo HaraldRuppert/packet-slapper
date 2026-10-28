@@ -870,7 +870,12 @@ def _publish_metrics(logger, ok, summary=None):
             if ok and summary is not None:
                 state["last_success_timestamp_seconds"] = now
                 state["result"] = summary
-            client.set(_METRICS_KEY, json.dumps(state, allow_nan=False))
+            try:
+                payload = json.dumps(state, allow_nan=False)
+            except ValueError as exc:  # bad data, retrying can't fix it
+                logger.warning(f"Packet Slapper: Prometheus metrics not published, result is not JSON-safe: {exc}")
+                return False
+            client.set(_METRICS_KEY, payload)
             if _redis_get_json(client, _METRICS_KEY) != state:
                 raise RuntimeError("read-back did not match what was written")
             return True
